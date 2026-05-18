@@ -7,7 +7,7 @@ from typing import Any, Literal, cast
 import polars as pl
 
 from whoosh.core.dialect import CSVDialect
-from whoosh.core.errors import FrameIOError
+from whoosh.core.errors import DialectError, FrameIOError
 
 _CSV_EXTS = {".csv", ".tsv", ".txt"}
 _JSON_EXTS = {".jsonl", ".ndjson"}
@@ -53,7 +53,7 @@ def scan_any(uri: str, hints: dict[str, Any] | None = None, dialect: CSVDialect 
     fmt = _infer_format(uri, fmt_override=hints.get("in_format"))
 
     if fmt == "csv":
-        d = dialect or CSVDialect()
+        d = dialect or _dialect_for_local_csv(uri)
         return pl.scan_csv(uri, **d.to_polars_kwargs())
     if fmt == "jsonl":
         return pl.scan_ndjson(uri)
@@ -79,6 +79,16 @@ def scan_any(uri: str, hints: dict[str, Any] | None = None, dialect: CSVDialect 
     raise FrameIOError(f"Unsupported input format: {fmt}")
 
 
+def _dialect_for_local_csv(uri: str) -> CSVDialect:
+    path = Path(uri)
+    if uri == "-" or not path.exists():
+        return CSVDialect()
+    try:
+        return CSVDialect.auto(path)
+    except DialectError:
+        return CSVDialect()
+
+
 def _write_stdout(df: pl.DataFrame, out_format: str) -> None:
     if out_format == "csv":
         sys.stdout.write(df.write_csv())
@@ -100,8 +110,6 @@ def sink_any(
     streaming: bool = True,
     compression: str | None = None,
 ) -> None:
-    fmt = _infer_format(out_uri, fmt_override=to_format or "auto")
-
     engine: Literal["streaming", "auto"] = "streaming" if streaming else "auto"
     df = lf.collect(engine=engine)
 
@@ -109,6 +117,8 @@ def sink_any(
         stdout_format = "csv" if to_format in (None, "auto") else str(to_format)
         _write_stdout(df, stdout_format)
         return
+
+    fmt = _infer_format(out_uri, fmt_override=to_format or "auto")
 
     out_path = Path(out_uri)
     out_path.parent.mkdir(parents=True, exist_ok=True)

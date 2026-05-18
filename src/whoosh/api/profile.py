@@ -36,7 +36,7 @@ def profile_table(lf: pl.LazyFrame, *, top_k: int = 10) -> dict[str, Any]:
         top_values = (
             lf.group_by(field.name)
             .agg(pl.len().alias("count"))
-            .sort("count", descending=True)
+            .sort(["count", field.name], descending=[True, False])
             .head(top_k)
             .collect()
             .to_dicts()

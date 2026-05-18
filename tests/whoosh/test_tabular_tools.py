@@ -16,6 +16,7 @@ from whoosh.infer import (
     infer_delimiter,
 )
 from whoosh.reports.markdown import profile_to_markdown
+from whoosh.reports.text import profile_to_text
 
 
 def test_sort_frame_multi_key() -> None:
@@ -81,7 +82,41 @@ def test_infer_helpers_and_markdown_report() -> None:
         {
             "rows": 1,
             "columns": 1,
-            "fields": [{"field": "id", "dtype": "Int64", "null_count": 0, "n_unique": 1}],
+            "fields": [
+                {
+                    "field": "id",
+                    "dtype": "Int64",
+                    "null_count": 0,
+                    "n_unique": 1,
+                    "min": 1,
+                    "max": 1,
+                    "mean": 1.0,
+                    "top_values": [{"id": 1, "count": 1}],
+                }
+            ],
         }
     )
     assert "# Whoosh Profile" in markdown
+    assert "| id | Int64 | 100.0% | 0 | 1 | 100.0% | 1 to 1, mean 1 |" in markdown
+    assert "| 1 | 1 | 100.0% |" in markdown
+
+    text = profile_to_text(
+        {
+            "rows": 1,
+            "columns": 1,
+            "fields": [
+                {
+                    "field": "id",
+                    "dtype": "Int64",
+                    "null_count": 0,
+                    "n_unique": 1,
+                    "min": 1,
+                    "max": 1,
+                    "mean": 1.0,
+                    "top_values": [{"id": 1, "count": 1}],
+                }
+            ],
+        }
+    )
+    assert "id (Int64)" in text
+    assert "top: 1 (1)" in text
