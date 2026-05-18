@@ -1,0 +1,1094 @@
+================================================================================
+                 WHOOSH  —  Build Plan (plan_tool.txt)
+        A Polars-native, modernised rewrite of kenfar/DataGristle
+              + a generic, pluggable S3 bucket explorer
+================================================================================
+
+Last edited : 2026-05-18
+Author      : design draft for new repo `whoosh` (working name)
+Status      : PLAN — no code yet, this document is the single source of truth
+Inspired by : https://github.com/kenfar/DataGristle  (BSD-licensed)
+              + ./liveintent_bucket_explorer.py
+              + ./explore_semcasting_bucket.py
+
+
+--------------------------------------------------------------------------------
+0. WHY A REWRITE
+--------------------------------------------------------------------------------
+
+DataGristle is a fantastic CLI toolbox (slicer, freaker, profiler, validator,
+viewer, differ, sorter, converter, dir_merger, metadata DB).  It is, however:
+
+  - Pinned to Python 3.8–3.11; no 3.12 / 3.13 / free-threaded build support.
+  - Almost entirely row-at-a-time, pure-python with stdlib `csv`.  This makes
+    it correct but ~30-100× slower than columnar Arrow/Polars on real files.
+  - No native parquet / arrow / jsonl / S3 / gzip / zstd story.  Compression
+    is bolted on per-tool and never type-aware.
+  - Configuration handled by a single 39 KB `configulator.py` with bespoke
+    arg/yaml/env merging — fragile, hard to test, hard to extend.
+  - SQLite "metadata" subsystem (`metadata.py` ≈ 60 KB, `simplesql.py`) is
+    rarely used in practice and bloats the install.
+  - No object-store first-class support.  The two scripts in this repo
+    (liveintent_bucket_explorer.py, explore_semcasting_bucket.py) are the
+    exact gap users hit: discover -> sample -> infer schema -> emit DDL.
+
+Goals for the rewrite:
+
+  G1. Same CLI surface (drop-in feeling) but everything renamed `whoosh_*`.
+  G2. Polars LazyFrame as the *only* execution engine for tabular ops;
+      pyarrow for IPC, parquet, avro, orc reads.
+  G3. Object-store (S3 / GCS / Azure / local / http) is a first-class IO
+      backend, not a bolt-on.  The S3 explorer becomes a real subcommand.
+  G4. Modern Python: 3.12 minimum, 3.13 supported (incl. free-threaded build
+      where Polars supports it), 3.14 forward-compatible.
+  G5. Streaming by default, with bounded memory; arbitrary-size CSV / JSONL.
+  G6. Pluggable type-inference, DDL emitters, credential providers.
+  G7. Strict typing, ruff-clean, mypy-strict, 90%+ coverage in core.
+  G8. One installable distribution (`pip install whoosh`) that exposes
+      ~12 console scripts + a Python API (`import whoosh`).
+  G9. Optional `whoosh-tui` (textual) for interactive exploration; optional
+      `whoosh-mcp` server so agents can call the same primitives.
+
+
+--------------------------------------------------------------------------------
+1. NAMING & MAPPING TO DATAGRISTLE
+--------------------------------------------------------------------------------
+
+Package          : whoosh                     (PyPI:  whoosh-cli   to avoid
+                                                clash with the unrelated
+                                                full-text-search `whoosh` pkg)
+Import name      : whoosh
+CLI entrypoints  : whoosh <subcommand>        AND  whoosh_<tool>  (aliases)
+
+  DataGristle name            ->  Whoosh name              Notes
+  ────────────────────────────────────────────────────────────────────────────
+  gristle_slicer              ->  whoosh_slicer            row/col slicing
+  gristle_freaker             ->  whoosh_freaker           freq distribution
+  gristle_profiler            ->  whoosh_profiler          file/field profile
+  gristle_validator           ->  whoosh_validator         schema validation
+  gristle_viewer              ->  whoosh_viewer            single-row TUI
+  gristle_differ              ->  whoosh_differ            keyed delta
+  gristle_sorter              ->  whoosh_sorter            CSV-aware sort
+  gristle_converter           ->  whoosh_converter         dialect/format conv
+  gristle_dir_merger          ->  whoosh_merger            dir consolidation
+  gristle_metadata            ->  (dropped — see §10)
+  gristle_md_reporter         ->  (replaced by whoosh_profiler --report md)
+
+  NEW in Whoosh:
+  ────────────────────────────────────────────────────────────────────────────
+  whoosh_explore              ->  generic object-store explorer  (§6)
+  whoosh_sql                  ->  run SQL on any file via Polars/DuckDB
+  whoosh_convert (alt)        ->  csv<->parquet<->jsonl<->avro<->orc
+  whoosh_pivot                ->  pivot/unpivot/explode
+  whoosh_sample               ->  reservoir / stratified sampling
+  whoosh                      ->  meta dispatcher  (`whoosh slicer ...`)
+
+
+--------------------------------------------------------------------------------
+2. TECH STACK (pinned, justified)
+--------------------------------------------------------------------------------
+
+Runtime
+  - Python                 >= 3.12,  <4.0           (PEP 695 generics, t-strings)
+  - polars                 >= 1.40                  core engine, lazy streaming
+  - pyarrow                >= 17                    parquet/avro/orc + IPC
+  - duckdb                 >= 1.2  (optional)       SQL fallback / joins
+  - obstore                >= 0.4  (rust crate via py)   unified object store
+    -> alt: fsspec + s3fs/gcsfs/adlfs if `obstore` doesn't fit on a platform
+  - boto3                  optional, only if user opts into the boto path
+  - aiobotocore + anyio    >= 4.4                   concurrent S3 listing/sampling
+  - pydantic               >= 2.7                   config / schema models
+  - typer (or click 8.x)   >= 0.12                  CLI; rich help, shell completion
+  - rich                   >= 13.7                  pretty stdout, tables, JSON
+  - textual                >= 0.70 (optional extra) `whoosh_viewer` TUI mode
+  - jsonschema             >= 4.22                  for `whoosh_validator`
+  - ruamel.yaml            >= 0.18                  config files (round-trip)
+  - structlog              >= 24.1                  structured logs
+  - orjson                 >= 3.10                  fast JSON for samples
+  - zstandard, python-snappy, lz4                   compression
+  - xxhash                 >= 3.4                   fast content hashing
+  - watchfiles             optional                 `whoosh_explore --watch`
+
+Build / dev
+  - uv (astral)           project + lockfile mgr  (replaces pip+venv+pip-tools)
+  - hatchling             PEP 517 build backend
+  - ruff                  >= 0.5     lint + format (replaces black, isort, flake8)
+  - mypy                  >= 1.10    --strict
+  - pytest, pytest-xdist, hypothesis, syrupy, moto[s3]
+  - mkdocs-material + mkdocstrings   docs site
+  - pre-commit, codespell, typos
+
+Why Polars (vs pandas / Dask / native csv)
+
+  * Vectorised, Rust-native, multi-threaded by default; CSV parser is the
+    fastest in Python land (often >2 GB/s on commodity hardware).
+  * LazyFrame -> streaming engine handles >RAM datasets row-group by row-group
+    with bounded memory.  Perfect for slicer/freaker/sorter/profiler.
+  * Native Parquet / Arrow / IPC / NDJSON readers; zero-copy to PyArrow.
+  * Expression API replaces ~all of DataGristle's `field_math`, `field_misc`,
+    `field_type`, `field_determinator` modules in <300 LOC.
+  * `scan_csv("s3://...")` reads Arrow-native, streaming, with predicate &
+    projection pushdown — single primitive subsumes file_io + csvhelper.
+
+
+--------------------------------------------------------------------------------
+3. REPOSITORY LAYOUT
+--------------------------------------------------------------------------------
+
+whoosh/
+├── pyproject.toml                  # uv + hatchling, all deps & extras
+├── uv.lock
+├── README.md
+├── LICENSE                         # BSD-3 (compat with DataGristle origin)
+├── CHANGELOG.md
+├── .pre-commit-config.yaml
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                  # ruff + mypy + pytest matrix
+│       ├── release.yml             # uv publish on tag
+│       └── benchmarks.yml          # nightly perf regressions vs DataGristle
+├── docs/                           # mkdocs site
+│   ├── index.md
+│   ├── concepts.md                 # LazyFrame, dialect, slice spec
+│   ├── tools/
+│   │   ├── slicer.md ... merger.md, explore.md
+│   ├── recipes/                    # cookbook: S3 -> Snowflake, JSON -> Parquet
+│   └── migration_from_datagristle.md
+├── benchmarks/                     # asv or pytest-benchmark
+│   ├── slicer_vs_datagristle.py
+│   ├── freaker_vs_datagristle.py
+│   └── csv_streaming_memory.py
+├── tests/
+│   ├── conftest.py
+│   ├── data/                       # tiny fixtures (kept under git)
+│   ├── golden/                     # snapshots (syrupy)
+│   ├── unit/
+│   ├── integration/                # moto[s3], local minio
+│   └── e2e/                        # subprocess-driven CLI tests
+└── src/whoosh/
+    ├── __init__.py                 # public API re-exports + __version__
+    ├── _version.py                 # generated by hatch-vcs from git tags
+    ├── cli/
+    │   ├── __init__.py             # `whoosh` typer app + dispatch table
+    │   ├── slicer.py               # entry: whoosh_slicer / whoosh slicer
+    │   ├── freaker.py
+    │   ├── profiler.py
+    │   ├── validator.py
+    │   ├── viewer.py
+    │   ├── differ.py
+    │   ├── sorter.py
+    │   ├── converter.py
+    │   ├── merger.py
+    │   ├── explore.py              # NEW
+    │   ├── sql.py                  # NEW
+    │   ├── sample.py               # NEW
+    │   └── pivot.py                # NEW
+    ├── core/
+    │   ├── __init__.py
+    │   ├── dialect.py              # CSVDialect dataclass + auto-detect
+    │   ├── slice_spec.py           # parse/apply python-slice syntax
+    │   ├── type_infer.py           # pluggable column-type inference
+    │   ├── schema.py               # pydantic Schema + diff
+    │   ├── frame_io.py             # scan_any() router: csv/parquet/jsonl/...
+    │   ├── compression.py          # gzip/zstd/snappy/lz4/bz2 transparent
+    │   ├── progress.py             # rich.Progress wrapper
+    │   ├── hashing.py              # xxhash3 64/128 + md5 (legacy)
+    │   ├── temp.py                 # external-merge spill dir mgmt
+    │   └── errors.py               # WhooshError hierarchy
+    ├── io/
+    │   ├── __init__.py
+    │   ├── store.py                # abstract ObjectStore (read/list/head)
+    │   ├── local.py
+    │   ├── s3.py                   # obstore or aiobotocore impl
+    │   ├── gcs.py
+    │   ├── azure.py
+    │   ├── http.py
+    │   ├── credentials.py          # profile/env/instance/web-identity/explicit
+    │   └── cache.py                # diskcache for HEAD/LIST results
+    ├── infer/
+    │   ├── __init__.py
+    │   ├── delimiter.py            # entropy-based sniffer (replaces csv.Sniffer)
+    │   ├── header.py
+    │   ├── codec.py                # decide gzip vs parquet vs jsonl from magic
+    │   ├── partition.py            # detect Hive, date-folder, DDMMYYYY, …
+    │   └── manifest.py             # _FORMAT, _SUCCESS, _committed, Glue, Iceberg
+    ├── ddl/
+    │   ├── __init__.py
+    │   ├── base.py                 # DDLEmitter interface
+    │   ├── snowflake.py
+    │   ├── bigquery.py
+    │   ├── redshift.py
+    │   ├── athena_glue.py
+    │   ├── duckdb.py
+    │   └── iceberg.py
+    ├── reports/
+    │   ├── __init__.py
+    │   ├── text.py                 # human-readable (current scripts' style)
+    │   ├── markdown.py
+    │   ├── json.py
+    │   └── html.py
+    ├── api/
+    │   ├── __init__.py             # high-level functions used by CLIs and
+    │   │                           # importable by users  (`whoosh.slice(...)`)
+    │   ├── slice.py
+    │   ├── freak.py
+    │   ├── profile.py
+    │   ├── validate.py
+    │   ├── differ.py
+    │   ├── sort.py
+    │   ├── convert.py
+    │   ├── merger.py
+    │   └── explore.py
+    └── mcp/                        # optional extra `pip install whoosh[mcp]`
+        └── server.py               # exposes the same primitives as MCP tools
+
+
+--------------------------------------------------------------------------------
+4. CORE LIBRARY — SHARED INTERNALS
+--------------------------------------------------------------------------------
+
+4.1  CSVDialect  (replaces datagristle/csvhelper.py)
+
+    @dataclass(frozen=True, slots=True)
+    class CSVDialect:
+        delimiter:        str  = ","
+        quotechar:        str  = '"'
+        doublequote:      bool = True
+        escapechar:       str | None = None
+        lineterminator:   str  = "\n"
+        quoting:          QuotingMode = QuotingMode.MINIMAL
+        has_header:       bool | None = None    # None = auto-detect
+        skip_initial_space: bool = False
+        encoding:         str  = "utf-8"
+        null_values:      tuple[str, ...] = ("", "NULL", "NA")
+
+    Helpers:
+        - dialect.auto(path, *, sample_bytes=131_072) -> CSVDialect
+              uses our `infer/delimiter.py` (entropy + Polars try-parse)
+        - dialect.to_polars_kwargs() -> dict
+        - dialect.to_arrow_options() -> pa.csv.ParseOptions
+        - dialect.to_snowflake_format() -> str   (FILE_FORMAT DDL fragment)
+
+4.2  SliceSpec  (replaces slice_specs.py + slice_processor.py — currently
+                 ~48 KB combined → target <800 LOC)
+
+    Grammar (compatible with DataGristle):
+        ":5,10:15,dept"      ->  cols 0..4 + 10..14 + named col 'dept'
+        "-100:"              ->  last 100 rows
+        ":100:0.25"          ->  random 25% sample of rows 0..99
+        "100:1:-1"           ->  rows 100..1 reverse
+        "-1"                 ->  last col / row
+        "name=foo"           ->  optional predicate form (extension)
+
+    Implementation:
+        - SliceSpec.parse(s: str, *, axis: Axis) -> SliceSpec
+        - apply to LazyFrame using a single .gather() / .filter() expr
+        - random-fraction implemented via pl.col("__rownum__") % bucket
+          so it stays streaming-friendly
+
+4.3  TypeInfer  (replaces field_type.py + field_determinator.py)
+
+    Priority of probes (cheapest first, short-circuit on match):
+        1.  empty            -> NULL
+        2.  integer          -> via Polars try_parse_int (vectorised)
+        3.  float            -> try_parse_float
+        4.  bool             -> {"true","false","t","f","0","1","yes","no"}
+        5.  date / datetime  -> try_parse with pluggable format list (ISO,
+                               RFC3339, common US/EU, epoch s/ms/us)
+        6.  uuid             -> regex + len
+        7.  md5/sha1/sha256  -> hex regex + len {32,40,64}
+        8.  json-blob        -> startswith "{"/"["
+        9.  compound("@@")   -> contains "@@"   (LiveIntent-flavoured)
+       10.  enum (low-card)  -> n_unique / n_total < 0.01 AND n_unique < 50
+       11.  varchar          -> fallback
+
+    The probe set is open: register custom ones via entry-point group
+    `whoosh.type_probes`.
+
+4.4  Schema  (pydantic v2)
+
+    class FieldSchema(BaseModel):
+        name: str
+        dtype: DType                    # mirrors Polars / Arrow types
+        nullable: bool = True
+        unique: bool = False
+        min: Any | None = None
+        max: Any | None = None
+        min_length: int | None = None
+        max_length: int | None = None
+        pattern: str | None = None      # ECMA-262 regex
+        enum: list[Any] | None = None
+        description: str | None = None
+
+    class TableSchema(BaseModel):
+        fields: list[FieldSchema]
+        primary_key: list[str] | None = None
+        @classmethod
+        def from_json_schema(cls, obj) -> "TableSchema": ...
+        @classmethod
+        def from_polars(cls, lf: pl.LazyFrame) -> "TableSchema": ...
+        def diff(self, other) -> SchemaDiff: ...
+        def to_pyarrow(self) -> pa.Schema: ...
+        def to_json_schema(self) -> dict: ...
+
+4.5  frame_io.scan_any(uri, hints=None) -> pl.LazyFrame
+
+    Single entry point used by every tool.  Dispatches on:
+        - URI scheme           (file/s3/gs/az/http)
+        - File extension       (csv, tsv, parquet, jsonl, ndjson, json,
+                               avro, orc, feather/ipc, gz, zst, snappy, lz4)
+        - Magic bytes (HEAD 16 bytes) — only if extension is ambiguous
+        - User overrides (`hints`)
+
+    Returns a Polars LazyFrame regardless of source format, so every CLI is
+    a thin wrapper around `scan_any(...) -> transform -> sink_any(...)`.
+
+4.6  Object-store layer  (`io/`)
+
+    class ObjectStore(Protocol):
+        def list(self, prefix: str, *, recursive=True,
+                 page_size=1000) -> AsyncIterator[ObjectMeta]: ...
+        def head(self, key: str) -> ObjectMeta: ...
+        def get_range(self, key: str, start: int, end: int) -> bytes: ...
+        def open_streaming(self, key: str) -> BinaryIO: ...
+
+    Implementations: LocalFS, S3Store, GCSStore, AzureStore, HTTPStore.
+
+    Single async path, with sync facade for CLI use.  Connection pooling and
+    concurrency knobs (default: min(32, 4×CPU)) live in `io.s3.S3Store`.
+
+    Credentials:
+        - whoosh creds resolve in this order, configurable:
+              1. CLI flags (--profile, --aws-key-id …)
+              2. WHOOSH_AWS_* / AWS_* env vars
+              3. ~/.aws/credentials and SSO cache
+              4. EC2 IMDSv2 / ECS task role / EKS web identity / GCE meta
+              5. plugin-provided  (entry-point: whoosh.credentials)
+
+4.7  Compression abstraction
+
+    A reader wrapper that detects gzip/zstd/snappy-framed/lz4 from magic and
+    streams chunks.  Crucially handles *truncated* gzip from S3 Range
+    requests, preserving the behaviour proven useful in
+    `liveintent_bucket_explorer.decompress_if_gzip`.
+
+4.8  Errors
+
+    class WhooshError(Exception): ...
+    class IOError(WhooshError): ...
+    class SchemaError(WhooshError): ...
+    class DialectError(WhooshError): ...
+    class CredentialError(WhooshError): ...
+
+    Every CLI maps exception class → exit code, and prints a rich,
+    actionable message (with `--debug` to show full traceback).
+
+
+--------------------------------------------------------------------------------
+5. CLI TOOLS — RE-IMAGINED ONE BY ONE
+--------------------------------------------------------------------------------
+
+For each tool we list (a) feature parity with DataGristle, (b) what changes,
+(c) flags, (d) implementation strategy in Polars.
+
+────────────────────────────────────────────────────────────────────────────
+5.1  whoosh_slicer
+────────────────────────────────────────────────────────────────────────────
+Parity   : python-style slice syntax for rows and cols, named columns,
+           include/exclude logic, random-fraction sampling.
+Changes  : streaming by default; works on parquet/jsonl/csv/s3 transparently;
+           predicate pushdown into Polars; --where for SQL-like filter.
+Flags    :
+    -i / --infile         (multi; - for stdin; s3://, gs://, https://)
+    -o / --outfile        (default stdout; ext drives output format)
+    -c / --cols           inclusion slice spec
+    -C / --exclude-cols   exclusion slice spec
+    -r / --rows           inclusion slice spec
+    -R / --exclude-rows   exclusion slice spec
+    --where               polars / SQL predicate (run via pl.sql)
+    --has-header / --no-has-header
+    -d --delimiter, -q --quoting, --escape, --encoding
+    --to-format csv|tsv|parquet|jsonl|ndjson|arrow
+    --streaming / --no-streaming
+    --threads N
+Impl     :
+    1. scan_any(infile) -> LazyFrame
+    2. SliceSpec.apply(lf, cols/rows)
+    3. (optional) lf = lf.sql_context().execute(where)
+    4. sink_any(outfile, lf, streaming=True)
+
+────────────────────────────────────────────────────────────────────────────
+5.2  whoosh_freaker
+────────────────────────────────────────────────────────────────────────────
+Parity   : group-by + count over N columns, sort, top-K, writelimit.
+Changes  : adds percent-of-total, cumulative, entropy, mode-share; can also
+           emit a small histogram for numeric cols.
+Flags    : -c/--cols, --sortcol, --sortorder asc|desc, --top N,
+           --as-percent, --as-cumulative, --histogram, -o, --format
+Impl     :
+    lf.group_by(cols).agg(pl.len().alias("count"))
+      .with_columns(pct=pl.col("count") / pl.col("count").sum())
+      .sort(...)
+      .head(N)
+      .sink_csv(out, streaming=True)
+
+────────────────────────────────────────────────────────────────────────────
+5.3  whoosh_profiler   (replaces gristle_profiler + gristle_md_reporter)
+────────────────────────────────────────────────────────────────────────────
+Parity   : dialect detection, per-field type / min / max / unique /
+           top values / median / variance / std.
+Changes  :
+    - Adds: null_pct, distinct_pct, byte size of column when written as
+      parquet, JSON-schema export, OpenLineage-compatible json output,
+      markdown data-dictionary export.
+    - Adds --hyperloglog flag for streaming approx-distinct on huge files.
+Flags    :
+    --infiles ...
+    --report text|json|md|html|openlineage   (default text)
+    --sample-rows N            (cap rows scanned; default = all)
+    --schema-out path.json     (dump TableSchema)
+    --ddl snowflake|bigquery|...
+Impl     :
+    Profiler builds a single LazyFrame plan with:
+        - count, null_count, n_unique (or hll), min, max, mean, median,
+          stddev, top-k via group_by().head()
+    All emitted in one .collect(streaming=True) -> Arrow table, then
+    rendered by `reports/` modules.
+
+────────────────────────────────────────────────────────────────────────────
+5.4  whoosh_validator
+────────────────────────────────────────────────────────────────────────────
+Parity   : field count + JSON-Schema-style validations: type, min/max
+           length, min/max value, enum, regex, required/blank.
+Changes  :
+    - Validations executed as Polars expressions (vectorised) on chunks
+      of the LazyFrame; fail records are streamed to errfile.
+    - Optional pydantic Schema model in addition to JSON Schema (yaml).
+    - --randomout uses xxhash bucketing (deterministic with seed).
+    - Exit code: 0 if all good, 1 if any row failed, 2 on schema error.
+Flags    :
+    -i, -o (good), -e (err; - for stderr), --validschema
+    -f / --field-cnt N
+    --err-out-fields            append error description to bad rows
+    --err-out-text              also emit a side-text report
+    --random-pct N --seed N
+    --verbosity quiet|normal|debug
+Impl     :
+    For each field: build an expression `validate(field, schema)` returning
+    a struct {ok: bool, errors: list[str]}, then split:
+        good = lf.filter(pl.all_horizontal(... "ok"))
+        bad  = lf.filter(~ ... )
+
+────────────────────────────────────────────────────────────────────────────
+5.5  whoosh_viewer
+────────────────────────────────────────────────────────────────────────────
+Parity   : show one record per screen with field names from header.
+Changes  :
+    - Two modes: plain (DataGristle style) and TUI (textual app) with
+      Up/Down navigation, search-in-field, jump-to-row, hex view for
+      binary, JSON pretty-print for `JSON_BLOB` cols.
+    - Works on any format via scan_any().
+Flags    : -i, -r N, --tui, -d, -q, --encoding
+Impl     :
+    Plain   : lf.slice(N, 1).collect() -> rich.print as transposed table.
+    TUI     : textual app w/ DataTable.  Uses lazy paging:
+              lf.collect_schema() once, then sink_ipc(tempfile) on demand.
+
+────────────────────────────────────────────────────────────────────────────
+5.6  whoosh_differ   (replaces gristle_differ)
+────────────────────────────────────────────────────────────────────────────
+Parity   : keyed compare, --compare-cols, --ignore-cols, sort+dedup of
+           inputs, post-delta transforms (sequence, copy field, variables),
+           produces .same / .insert / .delete / .chgold / .chgnew files.
+Changes  :
+    - Re-implements the row-pair merge from `file_delta.py` as a Polars
+      anti/semi/inner join, dropping >90% of the legacy code.
+    - Yaml config schema unchanged where possible — backward compat.
+    - --variables k:v supported and exposed as pl.lit() in transforms.
+Flags    : --infiles old new, --key-cols, --compare-cols, --ignore-cols,
+           --config-fn, --variables, -d, -q, --has-header, --out-dir
+Impl     :
+    a = scan_any(old);  b = scan_any(new)
+    by-key joins:
+        inserts = b.join(a, on=keys, how="anti")
+        deletes = a.join(b, on=keys, how="anti")
+        common  = b.join(a, on=keys, how="inner", suffix="_old")
+        chg     = common.filter(any(col_b != col_a for col in compare_cols))
+        same    = common.filter(all(col_b == col_a for col in compare_cols))
+    Apply post-delta transforms via lf.with_columns(...).
+
+────────────────────────────────────────────────────────────────────────────
+5.7  whoosh_sorter
+────────────────────────────────────────────────────────────────────────────
+Parity   : CSV-aware sort that safely handles embedded delimiters / quotes /
+           newlines.  Multi-key (`0sf 3ir` syntax: index, type, direction),
+           optional dedup.
+Changes  :
+    - Uses Polars' streaming external sort (spills to disk under
+      $WHOOSH_TMPDIR / OS tmp).  Replaces ~14 KB of hand-rolled merge-sort
+      in `file_sorter.py`.
+    - Adds --by name1:asc name2:desc:case-insensitive friendly syntax,
+      while keeping the terse `0sf` form for compatibility.
+Flags    : -i, -o, -k/--keys (multi), -D/--dedup, --case-insensitive,
+           --natural-sort, --temp-dir, --memory-limit
+Impl     :
+    lf.sort(by=keys, descending=...).unique(subset=keys if dedup else None)
+      .sink_csv(out, streaming=True)
+
+────────────────────────────────────────────────────────────────────────────
+5.8  whoosh_converter
+────────────────────────────────────────────────────────────────────────────
+Parity   : CSV dialect-to-dialect translation.
+Changes  :
+    - Universal converter across {csv,tsv,parquet,jsonl,ndjson,arrow,
+       avro,orc,xlsx-read-only}.  Lossless dtype preservation when
+       formats permit.
+    - --row-limit, --col-projection, --compression, --partition-by k1,k2
+      (writes Hive-partitioned parquet folder).
+Flags    : --in-format auto|csv|...,  --out-format auto|csv|parquet|...
+           plus all dialect-related flags (in- and out- variants).
+Impl     :
+    scan_any(infile).select(cols).sink_<format>(outfile, ...)
+
+────────────────────────────────────────────────────────────────────────────
+5.9  whoosh_merger   (replaces gristle_dir_merger)
+────────────────────────────────────────────────────────────────────────────
+Parity   : --source-dir, --dest-dir, --match-on name|md5|both,
+           --on-full-match, --on-partial-match, --dry-run, -r.
+Changes  :
+    - Default content hash is xxhash3_128 (≈30× faster than md5); md5 stays
+      available for legacy reproducibility.
+    - Concurrent hashing pool (threads, sized to disk type).
+    - Works against object stores too:
+          whoosh_merger --source-dir s3://a/x --dest-dir s3://b/y
+    - Dry-run prints a unified plan (rich.Tree) before any write.
+
+────────────────────────────────────────────────────────────────────────────
+5.10  whoosh_sample   (NEW)
+────────────────────────────────────────────────────────────────────────────
+Reservoir / fraction / stratified sampling that stays streaming-friendly.
+Flags    : --rows N | --fraction X | --stratify-by col --per-bucket N
+           --seed N --to-format
+Impl     : lf.with_row_index().filter(hash bucketing) for fraction; for
+           reservoir, use Polars chunked iter + algorithm-R in pure Python
+           over Arrow batches.
+
+────────────────────────────────────────────────────────────────────────────
+5.11  whoosh_pivot   (NEW)
+────────────────────────────────────────────────────────────────────────────
+Thin wrapper around pl.LazyFrame.pivot / unpivot / explode / melt.
+Flags    : --pivot index=,columns=,values=,agg=  or --unpivot id_vars=,
+           value_vars=
+
+────────────────────────────────────────────────────────────────────────────
+5.12  whoosh_sql   (NEW)
+────────────────────────────────────────────────────────────────────────────
+"DuckDB-on-anything" feel, but via Polars SQL context (with DuckDB
+fallback if user installs the extra):
+
+    whoosh_sql -i users.csv -i orders.parquet \
+        --query "SELECT u.id, count(*) c FROM users u
+                 JOIN orders o ON o.user_id=u.id GROUP BY u.id ORDER BY c DESC"
+        --to-format parquet -o out.parquet
+
+Impl    :
+    ctx = pl.SQLContext()
+    for path in infiles: ctx.register(name_from(path), scan_any(path))
+    ctx.execute(query).sink_*(out)
+
+
+--------------------------------------------------------------------------------
+6. whoosh_explore   —  the GENERIC S3 / object-store explorer
+--------------------------------------------------------------------------------
+
+This is the headline new subcommand and the place where the two existing
+scripts (liveintent + semcasting) get unified, generalised, and made
+reusable.
+
+6.1  Mission
+
+  Given one or more URIs (s3://bucket[/prefix], gs://..., file://...):
+    a. Discover the object tree.
+    b. Group objects into logical *datasets* (by prefix depth or detected
+       partitioning).
+    c. For each dataset, sample one or more real data files.
+    d. Infer schema (columns + types + delimiter + compression).
+    e. Detect delivery cadence over time (daily/weekly/monthly).
+    f. Emit a structured report and (optionally) target-specific DDL.
+
+  All read-only.  Never writes to the source bucket.
+
+6.2  CLI surface
+
+    whoosh_explore <uri> [<uri> ...]
+        --profile NAME                 # AWS / GCS profile
+        --credentials env|profile|instance|web-identity|explicit
+        --aws-key-id ...               # only if --credentials explicit
+        --aws-secret-key ...
+        --region us-east-1
+
+        --group-by depth:N             # default: depth:3 (LiveIntent style)
+              | partition               # auto-detect Hive / DDMMYYYY / etc.
+              | manifest                # group by detected _FORMAT/_SUCCESS
+
+        --partition-pattern             # extra user regex, may repeat
+            'year=(?P<y>\d{4})/month=(?P<m>\d{2})/day=(?P<d>\d{2})'
+            '(?P<d>\d{8})'
+
+        --sample-files N                # data files to sample per group (1)
+        --sample-bytes BYTES            # Range request size (default 512K)
+        --sample-strategy smallest|newest|random
+        --max-objects-per-group K       # cap LIST cost
+        --concurrency 32
+
+        --infer-schema / --no-infer-schema
+        --emit-ddl snowflake|bigquery|redshift|athena|duckdb|iceberg|none
+        --target-db DB --target-schema S
+        --stage-creds-template path.tmpl
+
+        --report text|json|md|html      (default text + json sidecar)
+        --report-out FILE
+        --cache-dir ~/.cache/whoosh     (LIST/HEAD results, TTL-bounded)
+        --watch                         (use watchfiles / S3 events; re-emit
+                                         on change; useful for ops dashboards)
+        --dry-run                       (LIST only, no GET)
+        --include 'glob*'  --exclude 'glob*'
+        --since 2026-01-01              (filter by LastModified)
+
+6.3  Internal pipeline (concurrent, async)
+
+      [Phase A] List
+        - async paginated list_objects_v2
+        - apply include/exclude/since filters
+        - bounded queue feeds Phase B
+
+      [Phase B] Classify & group
+        - classify each key:
+              data_file         (extension table — extensible)
+              manifest          (_FORMAT, _SUCCESS, _committed, manifest.json,
+                                 Glue v0/v1, Iceberg metadata.json)
+              checksum/metadata (.crc, _checksums)
+              hidden            (starts with .)
+        - assign each object to a Group key per --group-by mode
+
+      [Phase C] Per-group analysis (parallel up to --concurrency)
+        - find_best_sample(group, strategy)
+        - if manifest exists: download & parse for forced column names,
+          delimiter, compression  (LiveIntent _FORMAT, AWS Glue, dbt,
+          Iceberg/Hive)
+        - HEAD smallest file → confirm content-type / content-encoding
+        - GET Range bytes; decompress (gzip/zstd/snappy/lz4) with the
+          truncated-stream-safe reader
+        - dispatch on detected format:
+              csv/tsv   -> Polars `read_csv(io.BytesIO(data))` with hints
+              jsonl     -> pl.read_ndjson
+              parquet   -> pa.parquet.read_metadata(BufferReader)
+              avro/orc  -> via pyarrow
+        - cadence: parse date from each Group's partitioning  using a
+          partition-detector pipeline (Hive → DDMMYYYY → YYYYMMDD → ISO)
+        - assemble GroupReport pydantic model
+
+      [Phase D] Render & emit
+        - GroupReport[] -> reports/ formatter
+        - if --emit-ddl: DDLEmitter for chosen target dialect produces
+          CREATE TABLE / CREATE STAGE / EXTERNAL TABLE / Iceberg meta.
+
+6.4  Schemas / Models
+
+    class ObjectMeta(BaseModel):
+        key: str
+        size: int
+        last_modified: datetime
+        etag: str | None
+        content_type: str | None
+
+    class GroupReport(BaseModel):
+        group_key: str
+        prefix: str
+        object_count: int
+        data_object_count: int
+        total_size: int
+        partition_pattern: str | None
+        partition_values: list[str]      # sorted chronologically
+        latest_partition: str | None
+        delivery_cadence: Cadence
+        sample: SampleReport | None
+        manifest: ManifestReport | None
+        schema: TableSchema | None
+        ddl: dict[str, str]              # per target
+
+    class Cadence(BaseModel):
+        label: Literal["daily","weekly","monthly","irregular","unknown"]
+        avg_gap_days: float | None
+        min_gap_days: int | None
+        max_gap_days: int | None
+        gaps: list[int]
+
+    class SampleReport(BaseModel):
+        key: str
+        size: int
+        compression: Compression
+        format: Format
+        delimiter: str | None
+        sample_rows: list[list[str | None]]
+        row_count_in_sample: int
+
+6.5  Pluggable layers
+
+    Entry-point group               Purpose
+    --------------------------------------------------------------------
+    whoosh.partition_detectors      add custom regex/grammar partition
+                                    detectors (e.g. RudderStack, Segment,
+                                    Kafka-Connect S3 sink naming).
+    whoosh.manifest_parsers         add support for new manifest types
+                                    (e.g. Delta Lake _delta_log, Iceberg,
+                                    Hudi).
+    whoosh.ddl_emitters             register CREATE TABLE / STAGE for
+                                    other warehouses (Trino, ClickHouse).
+    whoosh.credentials              custom cred providers
+                                    (HashiCorp Vault, Doppler, 1Password).
+
+6.6  Source compatibility wrappers (transitional)
+
+  Two thin wrapper subcommands ship for two releases so existing scripts
+  keep working without rewrites:
+
+      whoosh_explore semcasting        # default args reproduce
+                                       # explore_semcasting_bucket.py output
+
+      whoosh_explore liveintent        # reproduces
+                                       # liveintent_bucket_explorer.py
+                                       # (incl. Snowflake DDL drafts)
+
+  These read a tiny YAML preset bundled with the package; nothing
+  hard-coded.  Useful for the team's existing runbooks.
+
+6.7  Outputs that match today's scripts
+
+  Text report = same shape & section headers users already know
+                (RAW Doctor.ID Parquet / RAW Cookie TSV / GOLD ... /
+                 SUMMARY table at the bottom).
+  JSON sidecar = machine-readable mirror, suitable for ingestion into
+                 a runbook / dashboards.
+
+
+--------------------------------------------------------------------------------
+7. PERFORMANCE OPTIMISATIONS  (vs DataGristle)
+--------------------------------------------------------------------------------
+
+P1. Columnar all the way.  Every tool converts to LazyFrame ASAP and
+    operates on Arrow buffers.  Python-level row loops are forbidden in
+    the hot path (CI lint rule: `pl.LazyFrame.collect` in CLI code
+    requires a comment with rationale).
+
+P2. Streaming engine by default.  `sink_*` everywhere; LazyFrame plans are
+    optimised with predicate & projection pushdown before execution.
+
+P3. Multi-file inputs as a single LazyFrame.
+        pl.scan_csv(["a.csv","b.csv","c.csv"])
+    Polars parallelises file reads across its thread pool.
+
+P4. S3 reads:
+    - Concurrent LIST with `aiobotocore`; default 32-way concurrency,
+      back-pressured with anyio.MemoryObjectStream.
+    - Range GETs for sampling (max 512 KB → fast tree walk).
+    - For full reads, prefer `polars.scan_parquet("s3://...")` which uses
+      `object_store` (Rust) with async + HTTP/2 connection pooling.
+    - LIST / HEAD response caching via `diskcache` keyed on
+      (bucket, prefix, ETag) — saves re-listing during repeated explores.
+
+P5. Compression handling stays zero-copy where possible
+    (Polars handles `.gz`, `.zst` natively when scanning).
+
+P6. Big sorts → Polars streaming external sort (spill to
+    $WHOOSH_TMPDIR).  No pure-python merge-sort code path.
+
+P7. Hashing: xxhash3_128 default; SIMD on x86_64, NEON on Apple Silicon.
+
+P8. JSON: orjson everywhere user-facing output is structured; orjson for
+    profiler --report json output and report sidecars.
+
+P9. CPU thread pinning honoured: `POLARS_MAX_THREADS` and
+    `WHOOSH_THREADS` env vars + `--threads` flag are unified into one
+    setting at startup.
+
+P10. Memory budget knob (`--memory-limit 4GiB`) translates to
+     POLARS_STREAMING_CHUNK_SIZE recommendations and a guard rail in
+     streaming sinks.
+
+P11. Cold-start: lazy-import heavy deps (pyarrow, boto3, textual) inside
+     each CLI module.  Goal: `whoosh --help` < 200 ms.
+
+P12. Free-threaded Python 3.13t: dependency support matrix tracked in
+     CI; once Polars + pyarrow ship wheels we expose `--gil-free` mode
+     for the LIST/HEAD/Range fan-out workloads.
+
+P13. Benchmark suite under `benchmarks/`:
+     - same inputs as DataGristle test fixtures + 1 GB synthetic CSV
+     - measured: wall time, peak RSS, syscall count (perf), allocs.
+     - nightly CI gate: regression fails if >10% slower than baseline.
+
+
+--------------------------------------------------------------------------------
+8. CONFIGURATION
+--------------------------------------------------------------------------------
+
+Replace the monolithic `configulator.py` with a layered model:
+
+    Priority (highest wins):
+      1. CLI flags
+      2. ENV vars (WHOOSH_*)
+      3. Project file:    ./.whoosh.yaml  or pyproject.toml [tool.whoosh]
+      4. User file:       $XDG_CONFIG_HOME/whoosh/config.yaml
+      5. Built-in defaults (pydantic Settings model)
+
+Schema:
+
+    # .whoosh.yaml
+    defaults:
+      dialect:
+        delimiter: ","
+        has_header: true
+      streaming: true
+      threads: auto
+    profiles:
+      prod-s3:
+        credentials: profile
+        profile: prod
+        region: us-east-1
+      explore-default:
+        group_by: depth:3
+        sample_bytes: 524288
+        emit_ddl: snowflake
+        target_db: RUDDERDB
+        target_schema: RS_PROFILES_QA
+
+CLI: `whoosh --config-profile prod-s3 explore s3://bucket/`.
+
+Secrets are NEVER written to disk by Whoosh.  `credentials: profile` and
+similar pointers only — actual key material always loaded from the
+provider chain.
+
+
+--------------------------------------------------------------------------------
+9. TESTING STRATEGY
+--------------------------------------------------------------------------------
+
+  Tier 1  unit            (per pure function in `core/`, `infer/`, `ddl/`)
+                          Hypothesis property tests for SliceSpec,
+                          delimiter sniffer, partition detectors.
+
+  Tier 2  golden CLI      For every CLI, run `whoosh_xxx ...` against the
+                          same fixture used by DataGristle's tests and
+                          assert byte-for-byte identical output (or
+                          documented differences captured as syrupy
+                          snapshots).  Migration confidence.
+
+  Tier 3  integration     - moto[s3] for `whoosh_explore` end-to-end.
+                          - Local MinIO container for streaming/big-file.
+                          - DuckDB roundtrip for DDL emitters.
+
+  Tier 4  performance     pytest-benchmark gating in CI; nightly run on
+                          1 GB / 10 GB synthetic CSV; trend chart published.
+
+  Tier 5  fuzz            Hypothesis + atheris (CSV input fuzzer) on the
+                          dialect sniffer and SliceSpec parser; cifuzz
+                          job once per week.
+
+  Coverage gates:
+      core/   >= 95%
+      cli/    >= 85%
+      io/     >= 80%  (real S3 paths covered via moto, not gated harder)
+
+
+--------------------------------------------------------------------------------
+10. THINGS WE EXPLICITLY DROP FROM DATAGRISTLE
+--------------------------------------------------------------------------------
+
+  - `metadata.py` (~60 KB) + `simplesql.py` SQLite-backed metadata DB.
+    Almost never used; users wanting cataloguing should integrate with
+    OpenLineage / DataHub / Atlan instead.  We expose OpenLineage JSON
+    via `whoosh_profiler --report openlineage`.
+
+  - `gristle_metadata`, `gristle_md_reporter` CLIs.
+
+  - Pure-stdlib CSV slow path.  Whoosh is Polars-first; if Polars can't
+    parse, neither can we (clearer failure surface).
+
+  - The custom `helpdoc.py` system — replaced by Typer/Click's built-in
+    rich help + `mkdocs` for long docs.
+
+  - The hand-rolled `file_deduper.py` external dedup — Polars'
+    `.unique(...)` in streaming mode does this and more.
+
+A `migration_from_datagristle.md` doc maps every dropped feature to its
+replacement (or rationale).
+
+
+--------------------------------------------------------------------------------
+11. PUBLIC PYTHON API
+--------------------------------------------------------------------------------
+
+The same primitives the CLIs use are first-class importable functions:
+
+    import whoosh as w
+
+    lf = w.scan_any("s3://bucket/data/*.parquet")
+    report = w.profile(lf, hyperloglog=True)
+    print(report.to_markdown())
+
+    good, bad = w.validate(
+        "users.csv",
+        schema=w.TableSchema.from_yaml("users.schema.yaml"),
+    )
+    good.sink_parquet("good.parquet")
+
+    explore = w.explore(
+        "s3://doceree-partner-liveintent-com/download/",
+        group_by="depth:3",
+        emit_ddl="snowflake",
+    )
+    explore.write_report("liveintent_report.md", format="md")
+
+Versioning: SemVer.  Stable API surface published in `whoosh.__all__`.
+Anything under `whoosh._*` or `whoosh.cli` is private.
+
+
+--------------------------------------------------------------------------------
+12. PACKAGING & DISTRIBUTION
+--------------------------------------------------------------------------------
+
+  - `pip install whoosh-cli`            full default install
+  - `pip install whoosh-cli[s3]`        s3 deps (default-on actually)
+  - `pip install whoosh-cli[gcs]`
+  - `pip install whoosh-cli[tui]`       textual viewer
+  - `pip install whoosh-cli[duckdb]`    SQL fallback engine
+  - `pip install whoosh-cli[mcp]`       MCP server bridge
+  - `pip install whoosh-cli[all]`
+
+  Binary distributions:
+    - Pure-python wheel (deps do the heavy lifting).
+    - `whoosh-bin` standalone artifacts via PyOxidizer / shiv / pex for
+      `curl | sh` install on EC2 / MWAA workers.
+    - `ghcr.io/<org>/whoosh:<version>` Docker image (Alpine + glibc tags).
+    - Homebrew tap.
+
+  Versioning: hatch-vcs from git tags, `v0.1.0` first release after
+  feature parity with DataGristle slicer+freaker+profiler+validator
+  (see roadmap §13).
+
+
+--------------------------------------------------------------------------------
+13. ROADMAP / MILESTONES
+--------------------------------------------------------------------------------
+
+Phase 0  — Foundations  (1 week)
+  [ ] Repo scaffold: pyproject, uv, ruff, mypy, pre-commit, CI matrix.
+  [ ] `core/` skeleton: CSVDialect, SliceSpec, frame_io.scan_any.
+  [ ] Errors hierarchy, logging, progress wrappers.
+  [ ] First CLI: `whoosh --version`, `whoosh --help`.
+
+Phase 1  — Tabular essentials  (2 weeks)
+  [ ] whoosh_slicer + golden tests vs DataGristle fixtures.
+  [ ] whoosh_freaker.
+  [ ] whoosh_converter.
+  [ ] whoosh_sample.
+  [ ] benchmarks/ baseline numbers vs DataGristle.
+
+Phase 2  — Inspection & validation  (2 weeks)
+  [ ] whoosh_profiler (text / json / md reports).
+  [ ] whoosh_validator (JSON Schema + pydantic schema).
+  [ ] whoosh_viewer plain mode (TUI deferred).
+
+Phase 3  — Sort, diff, merge  (1.5 weeks)
+  [ ] whoosh_sorter (streaming external sort).
+  [ ] whoosh_differ (join-based delta).
+  [ ] whoosh_merger (local + s3).
+
+Phase 4  — whoosh_explore  (2 weeks)   ← the headline new tool
+  [ ] io/store.py + S3Store with concurrent LIST/HEAD/range GET.
+  [ ] infer/{delimiter,header,codec,partition,manifest}.
+  [ ] reports/{text,json,md}.
+  [ ] ddl/{snowflake,bigquery,duckdb,athena_glue}.
+  [ ] Compat wrappers: `whoosh_explore semcasting|liveintent` presets.
+  [ ] Replace the two scripts in this repo by calls to whoosh_explore.
+
+Phase 5  — SQL, pivot, TUI  (1.5 weeks)
+  [ ] whoosh_sql via pl.SQLContext (+ duckdb extra).
+  [ ] whoosh_pivot.
+  [ ] whoosh_viewer TUI (textual).
+
+Phase 6  — Polish & 1.0  (1 week)
+  [ ] Docs site (mkdocs-material).
+  [ ] Migration guide + cookbook recipes.
+  [ ] PyPI publish; Docker image; Homebrew tap.
+  [ ] Tag v1.0.0.
+
+Phase 7  — Stretch goals (post-1.0)
+  [ ] whoosh-mcp:  MCP server exposing scan/profile/explore as tools.
+  [ ] Delta / Iceberg manifest parsers in `whoosh_explore`.
+  [ ] `--watch` mode driven by S3 EventBridge.
+  [ ] GPU/CUDA scan path via Polars-GPU when stable.
+
+
+--------------------------------------------------------------------------------
+14. RISKS & OPEN QUESTIONS
+--------------------------------------------------------------------------------
+
+R1. PyPI name `whoosh` is already taken by the full-text search library
+    (Whoosh-Reloaded).  Decision needed:
+       a) ship as `whoosh-cli` (recommended; keeps `whoosh_*` CLIs intact)
+       b) rename to `whooshql` / `whooshdata`
+       c) something else entirely
+
+R2. Polars semantics differ from `csv.Sniffer` in edge cases (e.g.
+    quoted-newline-with-only-LF inside fields).  Mitigation: golden CLI
+    tests use DataGristle's existing fixture set; documented diffs in
+    migration guide.
+
+R3. Object-store layer choice: `obstore` (Rust, very fast, newer) vs
+    `fsspec + s3fs/gcsfs/adlfs` (mature, ubiquitous).  Recommendation:
+    obstore as default, fsspec adapter behind a feature flag for users
+    in restricted envs.
+
+R4. Credentials handling parity with the two existing scripts.  Today
+    they hardcode keys (semcasting) or rely on default chain
+    (liveintent).  Whoosh must support both styles via --credentials
+    explicit (with a *loud* warning + log redaction) while strongly
+    preferring profile/role chains.
+
+R5. JSON-Schema dialect: DataGristle uses a quirky YAML-encoded variant
+    with `dg_type`, `dg_minimum`, `dg_maximum`.  Whoosh should accept
+    the legacy form (with a deprecation notice) and a modern JSON
+    Schema 2020-12 doc.
+
+R6. Free-threaded build: Polars + pyarrow + boto3 must all support 3.13t
+    before we can ship `--gil-free`.  Tracked via CI matrix.
+
+R7. License: source-of-truth code paths from DataGristle (slice grammar,
+    differ semantics) are BSD-licensed.  We keep BSD-3 to remain
+    re-distributable + warm credit in README + NOTICE.
+
+
+--------------------------------------------------------------------------------
+15. SUMMARY  (TL;DR)
+--------------------------------------------------------------------------------
+
+  *  New repo: **whoosh** (PyPI: `whoosh-cli`).
+  *  All DataGristle CLIs reimplemented on Polars LazyFrames with a
+     streaming default, ~10-100× faster on real workloads, while keeping
+     CLI flags and slice/key grammars compatible.
+  *  One new headline subcommand `whoosh_explore` generalises the two
+     S3 explorer scripts in this repo into a pluggable, async,
+     credential-aware, multi-cloud, schema-inferring, cadence-detecting,
+     DDL-emitting tool.
+  *  Modern Python (3.12+), uv + hatch + ruff + mypy strict, CI-gated
+     benchmarks, mkdocs docs, MCP optional.
+  *  Drops a few legacy modules (SQLite metadata DB, hand-rolled merge
+     sort, custom config system) in favour of better external solutions.
+  *  Backward-compat presets (`whoosh_explore semcasting|liveintent`)
+     keep this repo's existing runbooks working from day one.
+
+================================================================================
+                                 END OF PLAN
+================================================================================
