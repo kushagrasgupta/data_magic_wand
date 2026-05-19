@@ -5,8 +5,8 @@ from pathlib import Path
 
 import polars as pl
 
-from whoosh.api.freak import freak
-from whoosh.api.sort import sort_frame
+from whooshql.api.freak import freak
+from whooshql.api.sort import sort_frame
 
 
 def main() -> None:

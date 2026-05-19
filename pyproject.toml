@@ -3,11 +3,11 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "whoosh-cli"
+name = "whooshql"
 version = "0.1.0"
 description = "Polars-native data CLI toolkit inspired by DataGristle"
-readme = "README.md"
-requires-python = ">=3.12"
+readme = "README.rst"
+requires-python = ">=3.13"
 license = {text = "BSD-3-Clause"}
 authors = [{name = "Kushagra Gupta"}]
 dependencies = [
@@ -32,23 +32,23 @@ dev = [
 ]
 
 [project.scripts]
-whoosh = "whoosh.cli.__init__:main"
-whoosh_slicer = "whoosh.cli.slicer:main"
-whoosh_freaker = "whoosh.cli.freaker:main"
-whoosh_profiler = "whoosh.cli.profiler:main"
-whoosh_validator = "whoosh.cli.validator:main"
-whoosh_viewer = "whoosh.cli.viewer:main"
-whoosh_differ = "whoosh.cli.differ:main"
-whoosh_sorter = "whoosh.cli.sorter:main"
-whoosh_converter = "whoosh.cli.converter:main"
-whoosh_merger = "whoosh.cli.merger:main"
-whoosh_explore = "whoosh.cli.explore:main"
-whoosh_sql = "whoosh.cli.sql:main"
-whoosh_sample = "whoosh.cli.sample:main"
-whoosh_pivot = "whoosh.cli.pivot:main"
+whooshql = "whooshql.cli.__init__:main"
+whooshql_slicer = "whooshql.cli.slicer:main"
+whooshql_freaker = "whooshql.cli.freaker:main"
+whooshql_profiler = "whooshql.cli.profiler:main"
+whooshql_validator = "whooshql.cli.validator:main"
+whooshql_viewer = "whooshql.cli.viewer:main"
+whooshql_differ = "whooshql.cli.differ:main"
+whooshql_sorter = "whooshql.cli.sorter:main"
+whooshql_converter = "whooshql.cli.converter:main"
+whooshql_merger = "whooshql.cli.merger:main"
+whooshql_explore = "whooshql.cli.explore:main"
+whooshql_sql = "whooshql.cli.sql:main"
+whooshql_sample = "whooshql.cli.sample:main"
+whooshql_pivot = "whooshql.cli.pivot:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/whoosh"]
+packages = ["src/whooshql"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -61,21 +61,22 @@ include = [
   "/pyproject.toml",
   "/mypy.ini",
   "/.pre-commit-config.yaml",
+  "/README.rst",
 ]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.13"
 strict = true
 mypy_path = "src"
-packages = ["whoosh"]
+packages = ["whooshql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
