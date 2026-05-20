@@ -19,18 +19,16 @@ Install the published package::
 Install optional extras when you need them::
 
   python -m pip install "whooshql[s3]"
-  python -m pip install "whooshql[sql]"
   python -m pip install "whooshql[dev]"
 
-The ``s3`` extra pulls in ``boto3`` for object-store exploration. The ``sql``
-extra pulls in ``duckdb`` for SQL-oriented workflows. The ``dev`` extra installs
-build, lint, type-check, test, and release tooling.
+The ``s3`` extra pulls in ``boto3`` for object-store exploration. The ``dev``
+extra installs build, lint, type-check, test, and release tooling.
 
 For local development from a checkout::
 
   python -m venv .venv
   source .venv/bin/activate
-  python -m pip install -e ".[dev,s3,sql]"
+  python -m pip install -e ".[dev,s3]"
 
 What Ships
 ----------
@@ -65,6 +63,25 @@ A few common commands::
   whooshql merger --source-dir /tmp/source --dest-dir /tmp/dest --dry-run
   whooshql sql -i data/3x3_header.csv --query "select * from t_3x3_header"
   whooshql explore data --report md
+
+Handling Dirty CSVs
+^^^^^^^^^^^^^^^^^^^
+
+Real-world CSVs sometimes have a mostly clean column with a few shifted rows,
+Excel-formatted values, or stray state codes in numeric fields. When Polars
+cannot parse a CSV with its default type inference, whooshql now surfaces the
+same recovery flags in every tabular-reading command:
+
+* Inspect the column with ``whooshql viewer -i FILE -r N``
+* Force string-only reads with ``--all-string``
+* Pin one column type with ``--schema-override Zip=String``
+* Drop bad rows silently with ``--ignore-errors``
+* Treat a token as null with ``--null-value GA``
+
+Examples::
+
+  whooshql profiler -i data360_email_npi_list.csv --all-string --report md
+  whooshql profiler -i data360_email_npi_list.csv --schema-override Zip=Int64 --null-value GA --ignore-errors
 
 Supported Formats
 -----------------
@@ -108,6 +125,7 @@ available through ``--delimiter``, ``--quotechar``, ``--encoding``, and the
 Example::
 
   whooshql slicer -i data/3x3_header.csv -c alphas,integers -r 1:3
+  whooshql slicer -i dirty.csv -c Zip --schema-override Zip=String
 
 freaker
 ^^^^^^^
@@ -120,6 +138,7 @@ ordering, ``--top`` to limit the result, and ``--as-percent`` or
 Example::
 
   whooshql freaker -i data/colors.csv -c color --top 10
+  whooshql freaker -i dirty.csv -c Zip --all-string
 
 profiler
 ^^^^^^^^
@@ -132,6 +151,7 @@ control how many frequent values appear in the column breakdown.
 Example::
 
   whooshql profiler -i data/3x3_header.csv -i data/colors.csv --report json
+  whooshql profiler -i dirty.csv --schema-override Zip=String --report md
 
 validator
 ^^^^^^^^^
@@ -148,6 +168,7 @@ column count. Good rows and failed rows can be written separately with
 Example::
 
   whooshql validator -i data/3x3_header.csv --validschema schema.json
+  whooshql validator -i dirty.csv --field-cnt 19 --ignore-errors
 
 converter
 ^^^^^^^^^
@@ -160,6 +181,7 @@ Parquet output accepts ``--compression``.
 Example::
 
   whooshql converter -i data/3x3_header.csv -o /tmp/rows.parquet
+  whooshql converter -i dirty.csv -o /tmp/rows.parquet --all-string
 
 sorter
 ^^^^^^
@@ -171,6 +193,7 @@ The command also supports ``--dedup`` and ``--case-insensitive``.
 Example::
 
   whooshql sorter -i data/3x3_header.csv -k alphas:asc -k integers:desc
+  whooshql sorter -i dirty.csv -k Zip:asc --schema-override Zip=String
 
 differ
 ^^^^^^
@@ -184,6 +207,7 @@ exclude columns with ``--ignore-cols``. The output directory receives
 Example::
 
   whooshql differ --old old.csv --new new.csv --key-cols id --out-dir /tmp/diff
+  whooshql differ --old old.csv --new new.csv --key-cols id --ignore-errors
 
 merger
 ^^^^^^
@@ -208,6 +232,7 @@ or ``--stratify-by`` together with ``--per-bucket`` for grouped sampling. The
 Example::
 
   whooshql sample -i data/3x3_header.csv --rows 100
+  whooshql sample -i dirty.csv --rows 100 --all-string
 
 pivot
 ^^^^^
@@ -220,6 +245,7 @@ pivot aggregation supports ``sum``, ``mean``, ``min``, ``max``, and ``first``.
 Example::
 
   whooshql pivot -i data/3x3_header.csv --pivot-index id --pivot-columns kind --pivot-values value
+  whooshql pivot -i dirty.csv --unpivot-id-vars id --unpivot-value-vars Zip --schema-override Zip=String
 
 sql
 ^^^
@@ -235,6 +261,7 @@ name. If a stem starts with a digit, the command prefixes it with ``t_``.
 Example::
 
   whooshql sql -i data/3x3_header.csv -i data/colors.csv --query "select * from t_3x3_header"
+  whooshql sql -i dirty.csv --query "select Zip, count(*) from dirty group by Zip" --all-string
 
 viewer
 ^^^^^^
@@ -245,6 +272,7 @@ Render a single row in a readable transposed layout. Pass the row index with
 Example::
 
   whooshql viewer -i data/3x3_header.csv -r 0
+  whooshql viewer -i dirty.csv -r 274 --schema-override Zip=String
 
 explore
 ^^^^^^^
@@ -275,6 +303,7 @@ still need to pass a real URI after the preset name.
 Example::
 
   whooshql explore s3://my-bucket/data --report md --emit-ddl duckdb
+  whooshql explore ./data --report md --all-string
 
 Python API
 ----------

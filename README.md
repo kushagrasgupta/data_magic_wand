@@ -20,20 +20,18 @@ Install optional extras when you need them:
 
 ```bash
 python -m pip install "whooshql[s3]"
-python -m pip install "whooshql[sql]"
 python -m pip install "whooshql[dev]"
 ```
 
-The `s3` extra pulls in `boto3` for object-store exploration. The `sql` extra
-pulls in `duckdb` for SQL-oriented workflows. The `dev` extra installs build,
-lint, type-check, test, and release tooling.
+The `s3` extra pulls in `boto3` for object-store exploration. The `dev` extra
+installs build, lint, type-check, test, and release tooling.
 
 For local development from a checkout:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev,s3,sql]"
+python -m pip install -e ".[dev,s3]"
 ```
 
 ## What Ships

@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `--infer-schema-length`, `--all-string`, `--schema-override`,
+  `--null-value`, and `--ignore-errors` on all tabular-reading CLIs.
+
+### Changed
+
+- CSV parse errors now surface an actionable hint list with workaround flags.
+
 ## 0.1.0
 
 - Created the `whooshql` package scaffold with Hatchling.

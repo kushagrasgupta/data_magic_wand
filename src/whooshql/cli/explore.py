@@ -8,6 +8,14 @@ from typing import Any
 
 import typer
 
+from whooshql.cli._csv_options import (
+    AllStringOption,
+    IgnoreErrorsOption,
+    InferSchemaLengthOption,
+    NullValueOption,
+    SchemaOverrideOption,
+    add_csv_read_options,
+)
 from whooshql.core.frame_io import scan_any
 from whooshql.core.schema import TableSchema
 from whooshql.ddl.base import emit_basic_ddl
@@ -139,9 +147,12 @@ def _apply_filters(
     return output
 
 
-def _infer_local_schema(path: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+def _infer_local_schema(
+    path: str,
+    csv_read_options: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     try:
-        lf = scan_any(path)
+        lf = scan_any(path, **(csv_read_options or {}))
         schema = TableSchema.from_polars(lf).model_dump()
         sample_rows = lf.head(5).collect(engine="streaming").to_dicts()
         return schema, sample_rows
@@ -176,7 +187,19 @@ def run(
     since: str | None = typer.Option(None, "--since", help="YYYY-MM-DD"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     partition_pattern: list[str] = typer.Option([], "--partition-pattern"),
+    infer_schema_length: InferSchemaLengthOption = None,
+    all_string: AllStringOption = False,
+    schema_override: SchemaOverrideOption = None,
+    null_value: NullValueOption = None,
+    ignore_errors: IgnoreErrorsOption = False,
 ) -> None:
+    csv_options = add_csv_read_options(
+        infer_schema_length=infer_schema_length,
+        all_string=all_string,
+        schema_override=schema_override,
+        null_value=null_value,
+        ignore_errors=ignore_errors,
+    )
     resolved_targets = list(targets)
     active_presets = [t for t in targets if t in _PRESETS]
     if active_presets:
@@ -227,7 +250,10 @@ def run(
             }
 
             if infer_schema and not dry_run and uri.startswith("s3://") is False:
-                schema, rows = _infer_local_schema(sample_obj.key)
+                schema, rows = _infer_local_schema(
+                    sample_obj.key,
+                    csv_options.to_scan_kwargs(),
+                )
                 if sample_report is not None:
                     sample_report["sample_rows"] = rows
 

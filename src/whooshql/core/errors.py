@@ -6,6 +6,10 @@ class FrameIOError(WhooshQLError):
     """Input/output read/write errors."""
 
 
+class CSVParseError(FrameIOError):
+    """CSV parser errors with actionable recovery hints."""
+
+
 class SchemaError(WhooshQLError):
     """Schema parsing, conversion, or validation errors."""
 
