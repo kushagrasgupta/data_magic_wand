@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
@@ -214,7 +214,7 @@ def run(
                 f"Preset '{first}' was selected. Provide at least one concrete URI after it."
             )
 
-    since_dt = datetime.strptime(since, "%Y-%m-%d") if since else None
+    since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC) if since else None
 
     groups: dict[tuple[str, str], list[ObjectMeta]] = defaultdict(list)
 
